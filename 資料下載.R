@@ -127,14 +127,15 @@ fetch_data <- function(years = 2021:2022, months = 1:12) {
             
             df <- df %>% 
                 arrange(monitordate, siteid, itemid)
-            saveRDS(df, file = file.path(getwd(), output_dir, str_interp("apx_p_13_${year}-${month}.RDS")))
+            filename = str_interp("apx_p_13_${year}$[.02d]{month}.RDS")
+            saveRDS(df, file = file.path(getwd(), output_dir, filename))
         }
     }
 }
 
 tryCatch(
     {
-        fetch_data(years = 2020, months = 1:12)
+        fetch_data(years = 2020:2022, months = 1:12)
     },
     warning = function(x) {
         problems()
