@@ -127,7 +127,7 @@ fetch_data <- function(years = 2021:2022, months = 1:12) {
             
             df <- df %>% 
                 arrange(monitordate, siteid, itemid)
-            filename = str_interp("apx_p_13_${year}$[.02d]{month}.RDS")
+            filename = str_interp("${dataset}_${year}$[.02d]{month}.RDS")
             saveRDS(df, file = file.path(getwd(), output_dir, filename))
         }
     }
