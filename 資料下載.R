@@ -9,10 +9,51 @@ dotenv::load_dot_env()
 # aqx_p_13
 dataset <- "aqx_p_13"
 
+# https://airtw.epa.gov.tw/CHT/EnvMonitoring/Central/CentralMonitoring.aspx
+# 北部空品區：
+# - 桃園市
+# - 台北市
+# - 新北市
+# - 基隆市
+
 # API format ----
 base_url <- "https://data.epa.gov.tw"
 # 平臺提供格式包含JSON、 XML、 CSV，請依欲下載資料格式自行更換。
 # filter
+
+target_sitenames = c(
+    # 桃園
+    "中壢",
+    "龍潭",
+    "平鎮",
+    "觀音",
+    "大園",
+    "桃園",
+    # 新北
+    "淡水", 
+    "富貴角", 
+    "永和", 
+    "三重", 
+    "林口", 
+    "菜寮", 
+    "新莊", 
+    "板橋", 
+    "土城", 
+    "新店", 
+    "萬里", 
+    "汐止",
+    # 台北
+    "陽明", 
+    "大同", 
+    "松山", 
+    "古亭", 
+    "萬華", 
+    "中山", 
+    "士林", 
+    # 基隆
+    "基隆"
+)
+
 generate_filter <- function(sitename = c("中壢", "龍潭", "平鎮", "觀音", "大園", "桃園"), year = 2021, month = 1) {
     year <- toString(year)
     month <- sprintf("%02d", month)
@@ -79,6 +120,7 @@ fetch_data <- function(years = 2021:2022, months = 1:12) {
                         limit = 1000,
                         # 篩選條件
                         filters = generate_filter(
+                            sitename = target_sitenames,
                             year = year,
                             month = month
                         ) %>% I(),
@@ -114,7 +156,7 @@ fetch_data <- function(years = 2021:2022, months = 1:12) {
                 df <- readr::read_csv(
                     file = f,
                     col_types = rep("d", 24) %>% paste0(collapse = "") %>% paste0("icicccD", .),
-                    na = c("x", "")
+                    na = c("x", "", "NaN")
                 ) %>% 
                     rbind(., df)
                 
