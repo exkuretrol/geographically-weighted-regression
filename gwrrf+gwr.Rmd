@@ -1,0 +1,534 @@
+---
+title: "gwrrf+gwr"
+author: "我"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(GWmodel) ## GW models
+library(plyr) ## Data management
+library(sp) ## Spatial Data management
+library(spdep) ## Spatial autocorrelation
+library(RColorBrewer) ## Visualization
+library(classInt) ## Class intervals
+library(raster) ## spatial data
+library(grid) ## plot
+library(gridExtra) ## Multiple plot
+library(ggplot2) #  plotting
+library(tidyverse) # data
+library(SpatialML) # Geographically weigted regression
+```
+
+# Random Forest
+
+
+```{r}
+dataset <- "aqx_p_13"
+output_dir <- "air_quality"
+path_to_input_dir <- file.path(getwd(), output_dir, "${dataset}_RDS_annual_mean" %>% str_interp())
+files <- list.files(path_to_input_dir, full.names = TRUE)
+```
+
+```{r}
+train_df <- readRDS(file = files[1])
+test_df <- readRDS(file = files[2])
+valid_df <- readRDS(file = files[3])
+```
+
+```{r, echo=FALSE}
+library(h2o)
+h2o.init(nthreads = -1, max_mem_size = "12g", enable_assertions = FALSE)
+```
+
+```{r}
+train_df <- train_df %>%
+    select(-PM10) %>%
+    select(-`PM2.5`, everything())
+valid_df <- valid_df %>%
+    select(-PM10) %>%
+    select(-`PM2.5`, everything())
+test_df <- test_df %>%
+    select(-PM10) %>%
+    select(-`PM2.5`, everything())
+```
+
+```{r}
+metadata <- metadata %>%
+    select(siteid, sitename, twd97lon, twd97lat)
+```
+
+```{r}
+train_df <- train_df %>%
+    left_join(x = ., y = metadata, by = "sitename") %>%
+    select(siteid, sitename, twd97lon, twd97lat, everything())
+valid_df <- valid_df %>%
+    left_join(x = ., y = metadata, by = "sitename") %>%
+    select(siteid, sitename, twd97lon, twd97lat, everything())
+test_df <- test_df %>%
+    left_join(x = ., y = metadata, by = "sitename") %>%
+    select(siteid, sitename, twd97lon, twd97lat, everything())
+```
+
+```{r}
+train_df[, 5:17] <- scale(train_df[, 5:17])
+valid_df[, 5:17] <- scale(valid_df[, 5:17])
+test_df[, 5:17] <- scale(test_df[, 5:17])
+```
+
+```{r}
+train_hex <- as.h2o(train_df[, 5:18])
+valid_hex <- as.h2o(valid_df[, 5:18])
+test_hex <- as.h2o(test_df[, 5:18])
+```
+
+```{r}
+response <- "PM2.5"
+predictors <- setdiff(names(train_hex), response)
+```
+
+```{r}
+# Hyper-parameter
+drf_hyper_params <- list(
+    ntrees = seq(10, 5000, by = 10),
+    max_depth = c(10, 20, 30, 40, 50),
+    sample_rate = c(0.7, 0.8, 0.9, 1.0)
+)
+
+#  serach criteria
+drf_search_criteria <- list(
+    strategy = "RandomDiscrete",
+    max_models = 200,
+    max_runtime_secs = 900,
+    stopping_tolerance = 0.001,
+    stopping_rounds = 2,
+    seed = 202312
+)
+# Grid Search
+drf_grid <- h2o.grid(
+    algorithm = "randomForest",
+    grid_id = "drf_grid_IDx",
+    x = predictors,
+    y = response,
+    training_frame = train_hex,
+    validation_frame = valid_hex,
+    stopping_metric = "RMSE",
+    nfolds = 10,
+    keep_cross_validation_predictions = TRUE,
+    hyper_params = drf_hyper_params,
+    search_criteria = drf_search_criteria,
+    seed = 202109
+)
+```
+
+
+```{r}
+# RF Grid parameters
+drf_get_grid <- h2o.getGrid("drf_grid_IDx", sort_by = "RMSE", decreasing = FALSE)
+drf_get_grid@summary_table[1, ]
+```
+
+```{r}
+best_drf <- h2o.getModel(drf_get_grid@model_ids[[1]])
+best_drf
+```
+
+```{r}
+cv_drf <- best_drf@model$cross_validation_metrics_summary %>% .[, 1:2]
+```
+
+```{r}
+df <- test_df[, 1:4]
+df$Obs_2021 <- valid_df[, 18] %>% pull()
+df$Obs_2022 <- test_df[, 18] %>% pull()
+# validation data
+pred_valid <- as.data.frame(h2o.predict(object = best_drf, newdata = valid_hex))
+```
+
+```{r}
+df$RF_2021 <- pred_valid$predict
+# test data
+pred_test <- as.data.frame(h2o.predict(object = best_drf, newdata = test_hex))
+```
+
+```{r}
+df$RF_2022 <- pred_test$predict
+```
+
+```{r}
+cat(
+    "RF Validation RMSE:",
+    (df$RF_2021 - df$Obs_2021)^2 %>%
+        mean(., na.rm = TRUE) %>%
+        sqrt() %>%
+        round(., digits = 3),
+    "\n"
+)
+cat(
+    "RF Validation RMSE:",
+    abs(df$RF_2021 - df$Obs_2021) %>%
+        mean(., na.rm = TRUE) %>%
+        round(., digits = 3),
+    "\n"
+)
+cat(
+    "RF Validation R2:",
+    lm(Obs_2021 ~ RF_2021, df) %>%
+        summary() %>%
+        `$`("r.squared") %>%
+        round(., digits = 3),
+    "\n"
+)
+```
+
+```{r}
+cat(
+    "RF Test RMSE:",
+    (df$RF_2022 - df$Obs_2022)^2 %>%
+        mean(., na.rm = TRUE) %>%
+        sqrt() %>%
+        round(., digits = 3),
+    "\n"
+)
+cat(
+    "RF Test RMSE:",
+    abs(df$RF_2022 - df$Obs_2022) %>%
+        mean(., na.rm = TRUE) %>%
+        round(., digits = 3),
+    "\n"
+)
+cat(
+    "RF Test R2:",
+    lm(Obs_2022 ~ RF_2022, df) %>%
+        summary() %>%
+        `$`("r.squared") %>%
+        round(., digits = 3),
+    "\n"
+)
+```
+
+```{r}
+p.valid <- ggplot(data = df, aes(x = Obs_2021, y = RF_2021)) +
+    geom_point(size = 1.0) +
+    geom_smooth(method = "lm", se = FALSE, colour = "black", size = 0.5) +
+    # scale_x_continuous(limits = c(20, 120), breaks = seq(20, 120, 20)) +
+    # scale_y_continuous(limits = c(20, 120), breaks = seq(20, 120, 20)) +
+    theme_light() +
+    ggtitle("Validation data: 2021") +
+    theme(
+        plot.title = element_text(color = "black", size = 12, hjust = 0.5),
+        panel.background = element_rect(fill = "white", colour = "gray75", size = 0.5, linetype = "solid"),
+        axis.line = element_line(colour = "grey"),
+        panel.grid.major = element_blank(),
+        axis.text.x = element_text(size = 10, colour = "black"),
+        axis.text.y = element_text(size = 10, angle = 90, vjust = 0.5, hjust = 0.5, colour = "black")
+    ) +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed", size = 0.5) +
+    labs(x = "Observed", y = "Predicted")
+```
+
+```{r}
+p.test <- ggplot(data = df, aes(x = Obs_2022, y = RF_2022)) +
+    geom_point(size = 1.0) +
+    geom_smooth(method = "lm", se = FALSE, colour = "black", size = 0.5) +
+    # scale_x_continuous(limits = c(20, 120), breaks = seq(20, 120, 20)) +
+    # scale_y_continuous(limits = c(20, 120), breaks = seq(20, 120, 20)) +
+    theme_light() +
+    ggtitle("Test data - 2022") +
+    theme(
+        plot.title = element_text(color = "black", size = 12, hjust = 0.5),
+        panel.background = element_rect(fill = "white", colour = "gray75", size = 0.5, linetype = "solid"),
+        axis.line = element_line(colour = "grey"),
+        panel.grid.major = element_blank(),
+        axis.text.x = element_text(size = 10, colour = "black"),
+        axis.text.y = element_text(size = 10, angle = 90, vjust = 0.5, hjust = 0.5, colour = "black")
+    ) +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed", size = 0.5) +
+    labs(x = "Observed", y = "Predicted")
+```
+
+```{r}
+p <- grid.arrange(
+    p.valid,
+    p.test,
+    ncol = 2,
+    heights = c(30, 6),
+    top = textGrob(
+        "Random Forest Predicted PM2.5 (ppm)",
+        gp = gpar(fontsize = 18)
+    )
+)
+```
+```{r}
+save_ggplot2_plot(plot = p, filename = "PM2.5_2021_2022.png")
+```
+
+```{r}
+town <- shapefile("./Data_GWR/COUNTY_MOI_1090820.shp")
+```
+```{r}
+site_location <- shapefile("./air_quality/shp/siteinfo_121_10704.shp")
+site_location@data <- site_location@data %>%
+    colnames() %>%
+    tolower() %>%
+    `colnames<-`(site_location@data, .)
+site_location@data <- site_location@data %>%
+    select(-siteaddres) %>%
+    filter(!(sitename %in% c("潮州", "三重", "大同", "淡水", "陽明", "關山")))
+```
+
+
+```{r}
+site_location_df <- sp::merge(site_location, df, by = "sitename")
+```
+
+```{r}
+spplot(
+    site_location_df,
+    c("RF_2021", "Obs_2021", "RF_2022", "Obs_2022"),
+    key.space = "right",
+    as.table = TRUE,
+    cex = .7,
+    cuts = c(.5, 1, 2, 5, 10, 15, 20, 25),
+    main = "Random Forest Predicted PM2.5 (ppm)",
+    colorkey = TRUE,
+    sp.layout = list(panel.ggmap, g, first = TRUE)
+)
+png("./plots/rf_obs_2021_2022_1.png", height = 600, width = 800)
+
+dev.off()
+```
+
+```{r}
+library(vip)
+```
+
+```{r}
+features <- as.data.frame(train_hex) %>% select(-`PM2.5`)
+
+res <- as.data.frame(train_hex) %>% pull(`PM2.5`)
+
+pred <- function(object, newdata) {
+    results <- as.vector(h2o.predict(object, as.h2o(newdata)))
+    return(results)
+}
+```
+
+```{r}
+per.var.imp <- vip(
+    best_drf,
+    train = as.data.frame(train_hex),
+    method = "permute",
+    target = "PM2.5",
+    metric = "RMSE",
+    nsim = 5,
+    sample_frac = 0.5,
+    pred_wrapper = pred
+)
+```
+
+```{r}
+per_var_imp <- per.var.imp$data
+per_var_imp$Rank <- (per_var_imp$Importance - min(per_var_imp$Importance)) * 100 / (max(per_var_imp$Importance) - min(per_var_imp$Importance))
+head(per_var_imp)
+```
+
+```{r}
+ggplot(per_var_imp, aes(y = Rank, x = reorder(Variable, +Rank))) +
+    ylab("Scale-Importance") +
+    xlab("") +
+    geom_bar(stat = "identity", width = 0.45, fill = "grey") +
+    theme_bw() +
+    theme(
+        axis.line = element_line(colour = "black"),
+        panel.grid.major = element_blank(),
+        axis.text.y = element_text(size = 12),
+        axis.text.x = element_text(size = 12),
+        axis.title.x = element_text(size = 12),
+        axis.title.y = element_text(size = 12)
+    ) +
+    coord_flip() +
+    ggtitle("Permutation-based Feature Importance")
+```
+
+```{r}
+save_ggplot2_plot(filename = "permutation-based-feature-importance.png")
+```
+
+# Local Random Forest
+
+```{r}
+train_df_ <- train_df %>%
+    as.data.frame()
+coords <- train_df_[, 3:4]
+train_df_ <- train_df_ %>% 
+    select(-c(siteid, sitename, twd97lon, twd97lat))
+```
+
+```{r}
+library(spgwr)
+bw <- gwr.sel(
+    formula = `PM2.5` ~ SO2 + CO + O3 + NOx + NO + NO2 + WIND_SPEED + WIND_DIREC + AMB_TEMP + RAINFALL + RH + WS_HR + WD_HR,
+    data = train_df_,
+    coords = cbind(coords$twd97lon, coords$twd97lat),
+    gweight = gwr.Gauss,
+    verbose = FALSE
+)
+```
+
+```{r}
+grf_model <- grf(
+    formula = `PM2.5` ~ SO2 + CO + O3 + NOx + NO + NO2 + WIND_SPEED + WIND_DIREC + AMB_TEMP + RAINFALL + RH + WS_HR + WD_HR,
+    dframe = train_df_,
+    bw = 50,
+    ntree = 500,
+    mtry = 2,
+    kernel = "adaptive",
+    forests = TRUE,
+    coords = coords,
+    nthreads = 12
+)
+```
+
+```{r}
+grf_model$Global.Model
+```
+
+```{r}
+df <- grf_model$Local.Variable.Importance
+df$sitename <- train_df_$sitename
+site_location_df <- sp::merge(site_location, df, by = "sitename")
+```
+
+```{r}
+t <- site_location_df@data %>%
+    colnames() %>%
+    `[`(9:21)
+```
+
+```{r}
+df$GWRF_2021 <- predict.grf(grf_model, valid_df, x.var.name="twd97lon", y.var.name="twd97lat", local.w=1, global.w=0)
+df$GWRF_2022 <- predict.grf(grf_model, test_df, x.var.name="twd97lon", y.var.name="twd97lat", local.w=1, global.w=0)
+```
+
+```{r}
+cat("GWRF Validation RMSE:", round(sqrt(mean((df$GWRF_2021 - df$Obs_2021)^2, na.rm = TRUE)), digits = 3), "\n")
+cat("GWRF Validation MAE:", round(mean(abs(df$GWRF_2021 - df$Obs_2021), na.rm = TRUE), digits = 3), "\n")
+cat("GWRF Validation R2:", round(summary(lm(Obs_2021 ~ GWRF_2021, df))$r.squared, digits = 3), "\n")
+cat("GWRF Test RMSE:", round(sqrt(mean((df$GWRF_2022 - df$Obs_2022)^2, na.rm = TRUE)), digits = 3), "\n")
+cat("GWRF Test MAE:", round(mean(abs(df$GWRF_2022 - df$Obs_2022), na.rm = TRUE), digits = 3), "\n")
+cat("GWRF Test R2:", round(summary(lm(Obs_2022 ~ GWRF_2022, df))$r.squared, digits = 3), "\n")
+```
+
+```{r}
+for (i in 1:length(t))
+{
+    assign(
+        x = paste0("r", t[i]),
+        spplot(
+            site_location_df,
+            t[i],
+            key.space = "right",
+            as.table = TRUE,
+            cex = .7,
+            main = t[i],
+            colorkey = TRUE
+        )
+    )
+}
+```
+
+
+```{r}
+grid.arrange(
+    rSO2, rCO, rO3, rNOx, rNO, rNO2, rWIND_SPEED, rWIND_DIREC, rAMB_TEMP, rRAINFALL, rRH, rWS_HR, rWD_HR,
+    ncol = 7,
+    # heights = c(42, 6),
+    top = textGrob("Local Variable Importance", gp = gpar(fontsize = 25))
+)
+```
+
+```{r}
+p.valid <- ggplot(data = df, aes(x = Obs_2021, y = GWRF_2021)) +
+    geom_point(size = 1.0) +
+    geom_smooth(method = "lm", se = FALSE, colour = "black", size = 0.5) +
+    # scale_x_continuous(limits = c(20, 120), breaks = seq(20, 120, 20)) +
+    # scale_y_continuous(limits = c(20, 120), breaks = seq(20, 120, 20)) +
+    theme_light() +
+    ggtitle("Validation data: 2021") +
+    theme(
+        plot.title = element_text(color = "black", size = 12, hjust = 0.5),
+        panel.background = element_rect(fill = "white", colour = "gray75", size = 0.5, linetype = "solid"),
+        axis.line = element_line(colour = "grey"),
+        panel.grid.major = element_blank(),
+        axis.text.x = element_text(size = 10, colour = "black"),
+        axis.text.y = element_text(size = 10, angle = 90, vjust = 0.5, hjust = 0.5, colour = "black")
+    ) +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed", size = 0.5) +
+    labs(x = "Observed", y = "Predicted")
+```
+
+```{r}
+p.test <- ggplot(data = df, aes(x = Obs_2022, y = GWRF_2022)) +
+    geom_point(size = 1.0) +
+    geom_smooth(method = "lm", se = FALSE, colour = "black", size = 0.5) +
+    # scale_x_continuous(limits = c(20, 120), breaks = seq(20, 120, 20)) +
+    # scale_y_continuous(limits = c(20, 120), breaks = seq(20, 120, 20)) +
+    theme_light() +
+    ggtitle("Test data - 2022") +
+    theme(
+        plot.title = element_text(color = "black", size = 12, hjust = 0.5),
+        panel.background = element_rect(fill = "white", colour = "gray75", size = 0.5, linetype = "solid"),
+        axis.line = element_line(colour = "grey"),
+        panel.grid.major = element_blank(),
+        axis.text.x = element_text(size = 10, colour = "black"),
+        axis.text.y = element_text(size = 10, angle = 90, vjust = 0.5, hjust = 0.5, colour = "black")
+    ) +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed", size = 0.5) +
+    labs(x = "Observed", y = "Predicted")
+```
+
+```{r}
+p <- grid.arrange(
+    p.valid,
+    p.test,
+    ncol = 2,
+    heights = c(30, 6),
+    top = textGrob(
+        "GW Random Forest Predicted PM2.5 (ppm)",
+        gp = gpar(fontsize = 18)
+    )
+)
+```
+
+```{r}
+save_ggplot2_plot(p, filename = "gwrf_obj_2021_2022_0.png")
+```
+
+```{r}
+
+site_location_df <- sp::merge(site_location, df, by = "sitename")
+```
+
+```{r}
+png("./plots/gwrf_obs_2021_2022.png", height = 600, width = 800)
+spplot(
+    site_location_df,
+    c("GWRF_2021", "Obs_2021", "GWRF_2022", "Obs_2022"),
+    key.space = "right",
+    as.table = TRUE,
+    cex = .7,
+    cuts = c(.5, 1, 2, 5, 10, 15, 20, 25),
+    main = "GW Random Forest Predicted PM2.5 (ppm)",
+    colorkey = TRUE
+    # sp.layout = list(panel.ggmap, g, first = TRUE)
+)
+
+dev.off()
+```
+
+
+```{r}
+h2o.shutdown()
+```
